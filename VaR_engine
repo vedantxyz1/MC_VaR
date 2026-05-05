@@ -1,0 +1,260 @@
+import numpy as np
+import pandas as pd
+import os
+
+# =========================
+# FILE PATHS (SET HERE)
+# =========================
+BASE_DIR = r"C:\Users\Vedant Bundella\OneDrive - International Resources Holding\Desktop\Risk analytics\MC_VaR"
+
+PRICE_FILE = os.path.join(BASE_DIR, "prices.csv")
+TRADE_FILE = os.path.join(BASE_DIR, "tradeprices.csv")
+
+# =========================
+# CONFIG
+# =========================
+CONF = 0.95
+SIMS = 20000
+
+COMMODITY_MAP = {
+    'SIV6 Comdty': 'Silver',
+    'SIZ6 Comdty': 'Silver',
+    'GCZ6 Comdty': 'Gold',
+    'PLF7 Comdty': 'Platinum',
+    'PAZ6 Comdty': 'Palladium'
+}
+
+# =========================
+# LOAD DATA
+# =========================
+def get_data():
+    prices = pd.read_csv(PRICE_FILE, index_col=0, parse_dates=True).sort_index().ffill()
+    trades = pd.read_csv(TRADE_FILE)
+    trades["Date"] = pd.to_datetime(trades["Date"])
+    trades = trades.sort_values("Date")
+
+    # Precompute log returns ONCE
+    logret = np.log(prices / prices.shift(1)).dropna()
+
+    return prices, trades, logret
+
+
+# =========================
+# POSITION ENGINE
+# =========================
+def build_positions(trades, as_of_date, tickers):
+    df = trades.loc[trades["Date"] <= as_of_date]
+
+    if df.empty:
+        return pd.Series(0, index=tickers), pd.Series(0, index=tickers)
+
+    pos = df.groupby("Ticker")["Quantity"].sum()
+
+    avg_cost = df.groupby("Ticker").apply(
+        lambda x: np.average(x["Trade_Price"], weights=np.abs(x["Quantity"]))
+        if (not x.empty and x["Quantity"].sum() != 0) else 0
+    )
+
+    pos = pos.reindex(tickers).fillna(0)
+    avg_cost = avg_cost.reindex(tickers).fillna(0)
+
+    return pos, avg_cost
+
+
+# =========================
+# MTM (SNAPSHOT)
+# =========================
+def compute_mtm(px, pos, avg):
+    mtm = (px - avg) * pos
+    return mtm, float(mtm.sum())
+
+
+# =========================
+# MTM TIME SERIES (FAST + CORRECT)
+# =========================
+def mtm_time_series(trades, prices):
+
+    # Pivot trades
+    qty = trades.pivot_table(index="Date", columns="Ticker", values="Quantity", aggfunc="sum").fillna(0)
+    
+    # Calculate costs per trade (Quantity * Trade_Price)
+    trades_with_cost = trades.copy()
+    trades_with_cost["cost"] = trades_with_cost["Quantity"] * trades_with_cost["Trade_Price"]
+    cost = trades_with_cost.pivot_table(index="Date", columns="Ticker", values="cost", aggfunc="sum").fillna(0)
+
+    # Cumulative
+    qty = qty.cumsum().reindex(prices.index).ffill().fillna(0)
+    cost = cost.cumsum().reindex(prices.index).ffill().fillna(0)
+
+    px = prices.reindex(qty.index)
+
+    mtm = (px * qty - cost).sum(axis=1)
+
+    return mtm.reset_index().rename(columns={0: "mtm", "Date": "date"})
+
+
+# =========================
+# COVARIANCE
+# =========================
+def compute_cov(logret):
+    vol = logret.std()
+    corr = logret.corr()
+    cov = np.outer(vol, vol) * corr.values
+    cov += np.eye(len(cov)) * 1e-10
+    return cov
+
+
+def safe_cholesky(cov):
+    try:
+        return np.linalg.cholesky(cov)
+    except:
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        eigvals = np.clip(eigvals, 1e-12, None)
+        return eigvecs @ np.diag(np.sqrt(eigvals))
+
+
+# =========================
+# MONTE CARLO VAR
+# =========================
+def mc_var(logret, prices, pos):
+
+    cov = compute_cov(logret)
+    chol = safe_cholesky(cov)
+
+    z = np.random.normal(size=(SIMS, len(pos)))
+    shocks = z @ chol.T
+
+    px = prices.iloc[-1].values
+    sim_px = px * np.exp(shocks)
+
+    pnl = (sim_px - px) * pos.values
+    port_pnl = pnl.sum(axis=1)
+
+    var = -np.percentile(port_pnl, (1 - CONF) * 100)
+
+    return float(var), pnl
+
+
+# =========================
+# COMMODITY VIEW
+# =========================
+def commodity_view(prices, pos, mtm, pnl):
+
+    px = prices.iloc[-1]
+    mapping = pd.Series(COMMODITY_MAP).reindex(prices.columns)
+    mapping = mapping.fillna(pd.Series(prices.columns, index=prices.columns))
+
+    df = pd.DataFrame({
+        "pos": pos.values,
+        "mtm": mtm.values,
+        "px": px.values,
+        "ticker": prices.columns,
+        "commodity": mapping.values
+    })
+
+    grouped = df.groupby("commodity").sum()
+
+    results = []
+
+    for g, row in grouped.iterrows():
+
+        idx = df[df["commodity"] == g].index.tolist()
+
+        g_pnl = pnl[:, idx].sum(axis=1)
+
+        results.append({
+            "commodity": g,
+            "position": float(row["pos"]),
+            "mtm": float(row["mtm"]),
+            "notional": float(abs(row["px"] * row["pos"])),
+            "var": float(-np.percentile(g_pnl, (1-CONF)*100)),
+            "var_pct": float((-np.percentile(g_pnl, (1-CONF)*100) / abs(row["px"] * row["pos"]) * 100)
+                             if row["pos"] != 0 else 0)
+        })
+
+    return results
+
+
+# =========================
+# TICKER VIEW
+# =========================
+def ticker_view(prices, pos, avg, mtm, pnl):
+
+    px = prices.iloc[-1]
+    results = []
+
+    for i, t in enumerate(prices.columns):
+
+        if pos[t] == 0:
+            continue
+
+        notional = px[t] * abs(pos[t])
+
+        var = -np.percentile(pnl[:, i], (1-CONF)*100)
+
+        results.append({
+            "ticker": t,
+            "position": float(pos[t]),
+            "trade_price": float(avg[t]),
+            "market_price": float(px[t]),
+            "mtm": float(mtm[t]),
+            "var": float(var),
+            "var_pct": float(var / notional * 100 if notional else 0)
+        })
+
+    return results
+
+
+# =========================
+# MAIN ENGINE
+# =========================
+def run():
+
+    prices, trades, logret = get_data()
+    latest = prices.index[-1]
+
+    pos, avg = build_positions(trades, latest, prices.columns)
+    px = prices.iloc[-1]
+
+    mtm, total_mtm = compute_mtm(px, pos, avg)
+
+    port_var, pnl = mc_var(logret, prices, pos)
+
+    mtm_series = mtm_time_series(trades, prices)
+    
+    # Calculate historical VaR for the chart (last 30 points to save time)
+    history = []
+    # Use the same index as mtm_series but maybe just the tail
+    chart_dates = prices.index[-30:] if len(prices) > 30 else prices.index
+    
+    for d in chart_dates:
+        # Get positions as of that date
+        h_pos, _ = build_positions(trades, d, prices.columns)
+        if h_pos.sum() == 0:
+            h_var = 0
+        else:
+            # Use smaller sims for history to keep it snappy
+            h_var, _ = mc_var(logret.loc[:d], prices.loc[:d], h_pos)
+        
+        # Find corresponding mtm from mtm_series
+        h_mtm = mtm_series.loc[mtm_series['date'] == d, 'mtm'].values[0] if not mtm_series.empty else 0
+        
+        history.append({
+            "date": d.strftime("%Y-%m-%d"),
+            "mtm": float(h_mtm),
+            "var": float(h_var)
+        })
+
+    commodity = commodity_view(prices, pos, mtm, pnl)
+    tickers = ticker_view(prices, pos, avg, mtm, pnl)
+
+    return {
+        "summary": {
+            "mtm": total_mtm,
+            "var": port_var,
+            "date": latest.strftime("%Y-%m-%d")
+        },
+        "history": history,
+        "commodity": commodity,
+        "tickers": tickers
+    }
