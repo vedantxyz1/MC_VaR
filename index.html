@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Risk Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; background: #f0f2f5; color: #1c1e21; }
+        .card { background: white; padding: 25px; margin-bottom: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { padding: 12px 15px; border-bottom: 1px solid #f0f2f5; }
+        th { text-align: left; background-color: #f8f9fa; color: #606770; font-weight: 600; text-transform: uppercase; font-size: 0.75rem; letter-spacing: 1px; }
+        tr:hover { background-color: #f8f9fa; }
+        .summary-val { font-size: 1.5rem; font-weight: 700; color: #1a73e8; }
+        .pos { color: #28a745; }
+        .neg { color: #dc3545; }
+        h3 { margin-top: 0; color: #050505; border-left: 4px solid #1a73e8; padding-left: 10px; }
+    </style>
+</head>
+<body>
+
+<h2 style="color: #1a73e8; margin-bottom: 30px;">Portfolio Intelligence Dashboard</h2>
+
+<div class="card">
+    <h3>Executive Summary</h3>
+    <div style="display: flex; gap: 40px; margin-top: 15px;">
+        <div>
+            <div style="color: #606770; font-size: 0.85rem;">Net MTM</div>
+            <div id="summary-mtm" class="summary-val">--</div>
+        </div>
+        <div>
+            <div style="color: #606770; font-size: 0.85rem;">Portfolio VaR (95%)</div>
+            <div id="summary-var" class="summary-val" style="color: #dc3545;">--</div>
+        </div>
+        <div>
+            <div style="color: #606770; font-size: 0.85rem;">Snapshot Date</div>
+            <div id="summary-date" class="summary-val" style="color: #050505;">--</div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <h3>MTM Performance Trend</h3>
+    <div style="height: 350px;">
+        <canvas id="chart"></canvas>
+    </div>
+</div>
+
+<div class="card">
+    <h3>Commodity Exposure & Risk</h3>
+    <table id="commodity"></table>
+</div>
+
+<div class="card">
+    <h3>Asset Level Drilldown</h3>
+    <table id="ticker"></table>
+</div>
+
+<script>
+const formatMoney = (val) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(val);
+
+fetch('/api/data').then(r=>r.json()).then(d=>{
+    if (d.error) {
+        alert("Error: " + d.error);
+        return;
+    }
+
+    document.getElementById("summary-mtm").innerText = formatMoney(d.summary.mtm);
+    document.getElementById("summary-mtm").className = "summary-val " + (d.summary.mtm >= 0 ? "pos" : "neg");
+    document.getElementById("summary-var").innerText = formatMoney(d.summary.var);
+    document.getElementById("summary-date").innerText = d.summary.date;
+
+    // Chart
+    new Chart(document.getElementById("chart"), {
+        type: 'line',
+        data: {
+            labels: d.history.map(x=>x.date),
+            datasets: [
+                {
+                    label: "Cumulative MTM ($)",
+                    data: d.history.map(x=>x.mtm),
+                    borderColor: '#1a73e8',
+                    backgroundColor: 'rgba(26, 115, 232, 0.05)',
+                    borderWidth: 3,
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 0
+                },
+                {
+                    label: "VaR Limit (95%)",
+                    data: d.history.map(x=>x.var),
+                    borderColor: '#dc3545',
+                    borderWidth: 2,
+                    borderDash: [5, 5],
+                    fill: false,
+                    tension: 0.1,
+                    pointRadius: 0
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: { grid: { color: '#f0f2f5' } },
+                x: { grid: { display: false } }
+            },
+            plugins: {
+                legend: { display: true, position: 'bottom' }
+            }
+        }
+    });
+
+    // Commodity table
+    let c = "<tr><th>Commodity</th><th>Volume</th><th>MTM ($)</th><th>VaR ($)</th><th>VaR %</th></tr>";
+    d.commodity.forEach(x=>{
+        c += `<tr>
+            <td style="font-weight: 600;">${x.commodity}</td>
+            <td>${x.position.toLocaleString()}</td>
+            <td class="${x.mtm >= 0 ? 'pos' : 'neg'}">${formatMoney(x.mtm)}</td>
+            <td style="color: #dc3545;">${formatMoney(x.var)}</td>
+            <td style="font-weight: 600;">${x.var_pct.toFixed(2)}%</td>
+        </tr>`;
+    });
+    document.getElementById("commodity").innerHTML = c;
+
+    // Ticker table
+    let t = "<tr><th>Ticker</th><th>Position</th><th>Avg Cost</th><th>Mkt Price</th><th>MTM ($)</th><th>VaR ($)</th></tr>";
+    d.tickers.forEach(x=>{
+        t += `<tr>
+            <td><code style="background: #f0f2f5; padding: 2px 5px; border-radius: 4px;">${x.ticker}</code></td>
+            <td>${x.position.toLocaleString()}</td>
+            <td>${x.trade_price.toFixed(2)}</td>
+            <td>${x.market_price.toFixed(2)}</td>
+            <td class="${x.mtm >= 0 ? 'pos' : 'neg'}">${formatMoney(x.mtm)}</td>
+            <td style="color: #dc3545;">${formatMoney(x.var)}</td>
+        </tr>`;
+    });
+    document.getElementById("ticker").innerHTML = t;
+
+}).catch(err => {
+    console.error(err);
+    alert("System error: Unable to load risk data.");
+});
+</script>
+
+</body>
+</html>
